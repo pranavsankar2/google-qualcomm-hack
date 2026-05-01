@@ -10,6 +10,7 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import android.widget.ImageView
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -20,6 +21,8 @@ import androidx.compose.runtime.*
 import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
@@ -44,7 +47,6 @@ fun ScanScreen(vm: ScanViewModel, requestCamera: () -> Unit) {
     val shards         by vm.shards.collectAsState()
     val gaussians      by vm.gaussians.collectAsState()
     val executor       = remember { Executors.newSingleThreadExecutor() }
-    var showDepth      by remember { mutableStateOf(false) }
 
     val hasPermission = ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
         PackageManager.PERMISSION_GRANTED
@@ -52,155 +54,131 @@ fun ScanScreen(vm: ScanViewModel, requestCamera: () -> Unit) {
 
     Column(Modifier.fillMaxSize().background(Color.Black)) {
 
-        // ══ Top half: 3D point cloud OR depth map (toggle) ════════════════════
+        // ══ Top half: 3D point cloud ══════════════════════════════════════════
         Box(Modifier.weight(1f).fillMaxWidth()) {
+            PointCloudPanel(vm)
 
-            if (showDepth) {
-                // ── Depth view ─────────────────────────────────────────────────
-                DepthMapPanel(vm)
-
-                // Model status pills (top-left in depth mode)
-                Column(
-                    Modifier.align(Alignment.TopStart).padding(10.dp),
-                    verticalArrangement = Arrangement.spacedBy(5.dp)
-                ) {
-                    Pill("DEPTH")
-                    Pill(
-                        if (vm.midasLoaded) "MiDaS ✓" else "MiDaS ✗ missing",
-                        tint = if (vm.midasLoaded) Color(0xFF3FB950) else Color(0xFFF85149)
-                    )
-                    Pill(
-                        if (vm.renoLoaded) "RENO ✓" else "RENO ✗",
-                        tint = if (vm.renoLoaded) Color(0xFF3FB950) else Color(0xFFD29922)
-                    )
-                }
-
-                // Near/far legend (bottom-right in depth mode)
-                Row(
-                    Modifier.align(Alignment.BottomEnd).padding(horizontal = 10.dp, vertical = 8.dp),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Pill("near", tint = Color(0xFFFF6B6B))
-                    Pill("far",  tint = Color(0xFF6B8EFF))
-                }
-
-            } else {
-                // ── 3D point cloud ─────────────────────────────────────────────
-                PointCloudPanel(vm)
-
-                // Stats pills (top-left in 3D mode)
-                Column(
-                    Modifier.align(Alignment.TopStart).padding(10.dp),
-                    verticalArrangement = Arrangement.spacedBy(5.dp)
-                ) {
-                    val pts = (scanState as? ScanState.Running)?.pointCount
-                        ?: (scanState as? ScanState.Paused)?.pointCount ?: 0
-                    val nShards = (scanState as? ScanState.Running)?.shardCount
-                        ?: (scanState as? ScanState.Paused)?.shardCount
-                        ?: (scanState as? ScanState.Sharding)?.shardIndex ?: 0
-                    Pill("${pts.fmtK} pts")
-                    if (nShards > 0) Pill("$nShards shard${if (nShards > 1) "s" else ""}")
-                }
-
-                // Sharding overlay
-                if (scanState is ScanState.Sharding) {
-                    Surface(
-                        Modifier.align(Alignment.Center),
-                        color = Color.Black.copy(alpha = 0.78f),
-                        shape = RoundedCornerShape(14.dp)
-                    ) {
-                        Row(
-                            Modifier.padding(horizontal = 18.dp, vertical = 11.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(10.dp)
-                        ) {
-                            CircularProgressIndicator(
-                                Modifier.size(18.dp),
-                                color = MaterialTheme.colorScheme.primary,
-                                strokeWidth = 2.5.dp
-                            )
-                            Text(
-                                "Saving shard ${(scanState as ScanState.Sharding).shardIndex}  •  ${ScannerPipeline.SHARD_MAX_POINTS.fmtK} pts",
-                                color = Color.White, fontSize = 13.sp
-                            )
-                        }
-                    }
-                }
-
-                // Idle hint
-                if (gaussians.isEmpty() && scanState is ScanState.Idle) {
-                    Text(
-                        "Tap Start to begin scanning",
-                        Modifier.align(Alignment.Center),
-                        color = Color.White.copy(alpha = 0.4f), fontSize = 13.sp
-                    )
-                }
-
-                // Shard progress bar (bottom)
+            // Stats pills (top-left)
+            Column(
+                Modifier.align(Alignment.TopStart).padding(10.dp),
+                verticalArrangement = Arrangement.spacedBy(5.dp)
+            ) {
                 val pts = (scanState as? ScanState.Running)?.pointCount
                     ?: (scanState as? ScanState.Paused)?.pointCount ?: 0
-                val progress = pts.toFloat() / ScannerPipeline.SHARD_MAX_POINTS
-                if (progress > 0f) {
-                    LinearProgressIndicator(
-                        progress = { progress },
-                        modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(2.dp),
-                        color    = MaterialTheme.colorScheme.primary,
-                        trackColor = Color.White.copy(alpha = 0.08f)
-                    )
-                }
+                val nShards = (scanState as? ScanState.Running)?.shardCount
+                    ?: (scanState as? ScanState.Paused)?.shardCount
+                    ?: (scanState as? ScanState.Sharding)?.shardIndex ?: 0
+                Pill("${pts.fmtK} pts")
+                if (nShards > 0) Pill("$nShards shard${if (nShards > 1) "s" else ""}")
             }
 
-            // Perf badges + view toggle (top-right, always visible)
+            // Perf badges (top-right)
             Row(
                 Modifier.align(Alignment.TopEnd).padding(10.dp),
                 horizontalArrangement = Arrangement.spacedBy(5.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                // Show inference perf only in 3D mode
-                if (!showDepth) {
-                    val ms  = (scanState as? ScanState.Running)?.inferenceMs
-                    val sim = (scanState as? ScanState.Running)?.isSimulated ?: vm.isSimulated
-                    if (ms != null) {
-                        Pill("${ms}ms")
-                        Pill(if (sim) "SIM" else "NPU",
-                            tint = if (sim) Warning else Color(0xFF3FB950))
+                val ms = (scanState as? ScanState.Running)?.inferenceMs
+                if (ms != null) Pill("${ms}ms")
+                when {
+                    vm.isSimulated -> Pill("SIM", tint = Color(0xFFF85149))
+                    vm.npuActive   -> Pill("NPU", tint = Color(0xFF3FB950))
+                    else           -> Pill("CPU", tint = Warning)
+                }
+            }
+
+            // Sharding overlay
+            if (scanState is ScanState.Sharding) {
+                Surface(
+                    Modifier.align(Alignment.Center),
+                    color = Color.Black.copy(alpha = 0.78f),
+                    shape = RoundedCornerShape(14.dp)
+                ) {
+                    Row(
+                        Modifier.padding(horizontal = 18.dp, vertical = 11.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        CircularProgressIndicator(
+                            Modifier.size(18.dp),
+                            color = MaterialTheme.colorScheme.primary,
+                            strokeWidth = 2.5.dp
+                        )
+                        Text(
+                            "Saving shard ${(scanState as ScanState.Sharding).shardIndex}  •  ${ScannerPipeline.SHARD_MAX_POINTS.fmtK} pts",
+                            color = Color.White, fontSize = 13.sp
+                        )
                     }
                 }
-                ViewToggle(showDepth) { showDepth = it }
+            }
+
+            // Idle hint
+            if (gaussians.isEmpty() && scanState is ScanState.Idle) {
+                Text(
+                    "Tap Start to begin scanning",
+                    Modifier.align(Alignment.Center),
+                    color = Color.White.copy(alpha = 0.4f), fontSize = 13.sp
+                )
+            }
+
+            // Shard progress bar (bottom)
+            val pts = (scanState as? ScanState.Running)?.pointCount
+                ?: (scanState as? ScanState.Paused)?.pointCount ?: 0
+            val progress = pts.toFloat() / ScannerPipeline.SHARD_MAX_POINTS
+            if (progress > 0f) {
+                LinearProgressIndicator(
+                    progress = { progress },
+                    modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(2.dp),
+                    color    = MaterialTheme.colorScheme.primary,
+                    trackColor = Color.White.copy(alpha = 0.08f)
+                )
             }
         }
 
         HorizontalDivider(color = Color.White.copy(alpha = 0.10f), thickness = 1.dp)
 
-        // ══ Bottom half: camera preview ═══════════════════════════════════════
+        // ══ Bottom half: depth video + live camera PiP ════════════════════════
         Box(Modifier.weight(1f).fillMaxWidth()) {
-            AndroidView(
-                factory = { ctx ->
-                    val pv = PreviewView(ctx)
-                    val future = ProcessCameraProvider.getInstance(ctx)
-                    future.addListener({
-                        val provider = future.get()
-                        val preview  = Preview.Builder().build()
-                            .also { it.setSurfaceProvider(pv.surfaceProvider) }
-                        val analysis = ImageAnalysis.Builder()
-                            .setTargetResolution(Size(640, 480))
-                            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                            .build()
-                            .also { ia -> ia.setAnalyzer(executor) { img -> vm.onFrame(img) } }
-                        runCatching {
-                            provider.unbindAll()
-                            provider.bindToLifecycle(
-                                lifecycleOwner, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis
-                            )
-                        }
-                    }, ContextCompat.getMainExecutor(ctx))
-                    pv
-                },
-                modifier = Modifier.fillMaxSize()
-            )
 
-            // Recording status dot
+            // Full-area depth map
+            DepthMapPanel(vm)
+
+            // Live camera feed — small PiP cutout (bottom-start corner)
+            Box(
+                Modifier
+                    .align(Alignment.BottomStart)
+                    .padding(10.dp)
+                    .size(width = 110.dp, height = 150.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .border(1.5.dp, Color.White.copy(alpha = 0.40f), RoundedCornerShape(8.dp))
+            ) {
+                AndroidView(
+                    factory = { ctx ->
+                        val pv = PreviewView(ctx)
+                        val future = ProcessCameraProvider.getInstance(ctx)
+                        future.addListener({
+                            val provider = future.get()
+                            val preview  = Preview.Builder().build()
+                                .also { it.setSurfaceProvider(pv.surfaceProvider) }
+                            val analysis = ImageAnalysis.Builder()
+                                .setTargetResolution(Size(640, 480))
+                                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                                .build()
+                                .also { ia -> ia.setAnalyzer(executor) { img -> vm.onFrame(img) } }
+                            runCatching {
+                                provider.unbindAll()
+                                provider.bindToLifecycle(
+                                    lifecycleOwner, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis
+                                )
+                            }
+                        }, ContextCompat.getMainExecutor(ctx))
+                        pv
+                    },
+                    modifier = Modifier.fillMaxSize()
+                )
+            }
+
+            // Recording status dot (top-left)
             Row(
                 Modifier.align(Alignment.TopStart).padding(10.dp),
                 verticalAlignment = Alignment.CenterVertically,
@@ -224,6 +202,23 @@ fun ScanScreen(vm: ScanViewModel, requestCamera: () -> Unit) {
                     fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp
                 )
             }
+
+            // Model status pills (top-right)
+            Column(
+                Modifier.align(Alignment.TopEnd).padding(10.dp),
+                verticalArrangement = Arrangement.spacedBy(5.dp),
+                horizontalAlignment = Alignment.End
+            ) {
+                Pill(
+                    if (vm.midasLoaded) "MiDaS ✓" else "MiDaS ✗ missing",
+                    tint = if (vm.midasLoaded) Color(0xFF3FB950) else Color(0xFFF85149)
+                )
+                Pill(
+                    if (vm.renoLoaded) "RENO ✓" else "RENO ✗",
+                    tint = if (vm.renoLoaded) Color(0xFF3FB950) else Color(0xFFD29922)
+                )
+            }
+
         }
 
         // ══ Control bar ═══════════════════════════════════════════════════════
@@ -268,41 +263,7 @@ fun ScanScreen(vm: ScanViewModel, requestCamera: () -> Unit) {
     }
 }
 
-// ── View toggle (3D ↔ Depth) ──────────────────────────────────────────────────
-
-@Composable
-private fun ViewToggle(showDepth: Boolean, onToggle: (Boolean) -> Unit) {
-    Surface(
-        color = Color.Black.copy(alpha = 0.60f),
-        shape = RoundedCornerShape(8.dp)
-    ) {
-        Row(
-            Modifier.padding(3.dp),
-            horizontalArrangement = Arrangement.spacedBy(3.dp)
-        ) {
-            listOf(false to "3D", true to "Depth").forEach { (isDepth, label) ->
-                val active = showDepth == isDepth
-                Surface(
-                    onClick = { onToggle(isDepth) },
-                    color = if (active) MaterialTheme.colorScheme.primary
-                            else Color.Transparent,
-                    shape = RoundedCornerShape(6.dp)
-                ) {
-                    Text(
-                        label,
-                        Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
-                        color = if (active) Color.White else Color.White.copy(alpha = 0.55f),
-                        fontSize = 12.sp, fontWeight = FontWeight.SemiBold
-                    )
-                }
-            }
-        }
-    }
-}
-
 // ── Depth map panel ───────────────────────────────────────────────────────────
-// Uses AndroidView(ImageView) so bitmap frames go directly to the view
-// without triggering Compose recomposition — much lower latency.
 
 @Composable
 private fun DepthMapPanel(vm: ScanViewModel) {
@@ -325,7 +286,7 @@ private fun DepthMapPanel(vm: ScanViewModel) {
                     }
                 }
             },
-            modifier = Modifier.fillMaxSize()
+            modifier = Modifier.fillMaxSize().rotate(90f)
         )
         if (!hasDepth) {
             Text(

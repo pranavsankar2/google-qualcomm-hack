@@ -34,17 +34,8 @@ android {
     buildFeatures { compose = true }
 
     packaging {
-        jniLibs {
-            useLegacyPackaging = true
-            pickFirsts += "**/libLiteRt.so"
-            pickFirsts += "**/libLiteRtClGlAccelerator.so"
-        }
+        jniLibs { useLegacyPackaging = true }
     }
-}
-
-// litert-api ships stub classes duplicated by litert core — drop it globally.
-configurations.all {
-    exclude(group = "com.google.ai.edge.litert", module = "litert-api")
 }
 
 dependencies {

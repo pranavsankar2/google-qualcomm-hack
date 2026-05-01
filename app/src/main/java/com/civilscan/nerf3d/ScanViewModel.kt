@@ -23,6 +23,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import java.io.ByteArrayOutputStream
+import java.util.concurrent.atomic.AtomicBoolean
 
 class ScanViewModel(app: Application) : AndroidViewModel(app) {
 
@@ -41,6 +42,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     val shards: StateFlow<List<ExportedFile>> = _shards.asStateFlow()
 
     val isSimulated:  Boolean get() = pipeline.isSimulated
+    val npuActive:    Boolean get() = pipeline.npuActive
     val midasLoaded:  Boolean = !pipeline.isSimulated   // fixed at init time, no StateFlow needed
     val renoLoaded:   Boolean = pipeline.renoLoaded
 
@@ -120,10 +122,13 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
 
     private var framesSinceGlUpdate = 0
     @Volatile private var pauseAfterShard = false
+    private val processing = AtomicBoolean(false)
 
     fun onFrame(image: ImageProxy) {
         val bmp = image.toBitmap(); image.close()
         if (bmp == null || _state.value !is ScanState.Running) return
+        // Drop frame if the pipeline is still working on the previous one
+        if (!processing.compareAndSet(false, true)) return
         val R   = latestR
         val acc = latestAcc
         // Rotate linear acceleration from device frame to world frame: a_world = R * a_device
@@ -134,6 +139,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         ) else null
 
         viewModelScope.launch(Dispatchers.Default) {
+          try {
             val result  = pipeline.processFrame(bmp, R, accWorld)
             val current = _state.value as? ScanState.Running ?: return@launch
             val pts     = pipeline.getGaussians().size
@@ -174,6 +180,9 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                     _gaussians.value = pipeline.getGaussians()
                 }
             }
+          } finally {
+            processing.set(false)
+          }
         }
     }
 

@@ -40,7 +40,7 @@ class ScannerPipeline(context: Context) {
         const val ENC_W = 224; const val ENC_H = 224; const val LATENT_DIM = 1024
 
         // Depth inference throttle: run MiDaS every N frames, reuse last depth in between
-        private const val DEPTH_SKIP = 3
+        private const val DEPTH_SKIP = 6
 
         // Pinhole intrinsics for 256×256 (~65° HFOV rear camera)
         private const val FX = 190f; private const val FY = 190f
@@ -103,7 +103,8 @@ class ScannerPipeline(context: Context) {
     private var prevRrel:  FloatArray?          = null  // previous relative R (world_cam)
 
     // Depth visualization
-    @Volatile private var latestDepthArray: Array<FloatArray>? = null
+    @Volatile private var latestDepthArray:  Array<FloatArray>? = null
+    @Volatile private var cachedDepthBitmap: Bitmap?            = null
 
     // Accelerometer integration
     private var velX = 0f; private var velY = 0f; private var velZ = 0f
@@ -120,7 +121,7 @@ class ScannerPipeline(context: Context) {
         worldTx = 0f; worldTy = 0f; worldTz = 0f
         prevGray = null; prevDepth = null; prevRrel = null
         velX = 0f; velY = 0f; velZ = 0f; lastFrameMs = 0L
-        latestDepthArray = null; depthFrameCounter = 0
+        latestDepthArray = null; cachedDepthBitmap = null; depthFrameCounter = 0
     }
 
     fun resetAccumulationOnly() {
@@ -151,9 +152,10 @@ class ScannerPipeline(context: Context) {
     fun getGaussians(): List<GaussianPoint> = acc.toList()
     fun close() { manager.close() }
 
-    fun getDepthBitmap(): Bitmap? {
-        val d = latestDepthArray ?: return null
-        val bmp = Bitmap.createBitmap(DEPTH_W, DEPTH_H, Bitmap.Config.ARGB_8888)
+    fun getDepthBitmap(): Bitmap? = cachedDepthBitmap
+
+    private fun buildDepthBitmap(d: Array<FloatArray>): Bitmap {
+        val bmp    = Bitmap.createBitmap(DEPTH_W, DEPTH_H, Bitmap.Config.ARGB_8888)
         val pixels = IntArray(DEPTH_W * DEPTH_H)
         for (v in 0 until DEPTH_H) for (u in 0 until DEPTH_W) {
             val n = ((d[v][u] - MIN_D) / (MAX_D - MIN_D)).coerceIn(0f, 1f)
@@ -181,7 +183,8 @@ class ScannerPipeline(context: Context) {
             depthOut[0].forEach { r -> r.forEach { it.fill(0f) } }
             models.gs!!.run(depthIn, depthOut)
             depth = buildDepth()
-            latestDepthArray = depth
+            latestDepthArray  = depth
+            cachedDepthBitmap = buildDepthBitmap(depth)
         } else {
             depth = latestDepthArray!!
         }
