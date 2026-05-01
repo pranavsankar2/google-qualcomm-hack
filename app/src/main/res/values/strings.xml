@@ -1,7 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">NeRF Scanner</string>
-    <string name="user_sender">User</string>
-    <string name="assistant_sender">Gemma 4</string>
-    <string name="error_init">Failed to initialize engine</string>
-    <string name="error_send">Failed to send message</string>
+    <string name="app_name">CivilScan 3D</string>
 </resources>
