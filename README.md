@@ -1,8 +1,8 @@
-# CivilScan 3D
+# On-Device 3D Spatial Mapping
 
 ## Application Description
 
-**CivilScan 3D** is an Android mobile application that enables rapid structural engineering assessment through AI-powered 3D scanning. It captures high-fidelity point clouds using mobile device cameras and analyzes them for civil engineering metrics to support infrastructure inspection, damage assessment, and structural monitoring.
+**On-Device 3D Spatial Mapping** is an Android mobile application that enables rapid structural engineering assessment through AI-powered 3D scanning. It captures high-fidelity point clouds using mobile device cameras and analyzes them for civil engineering metrics to support infrastructure inspection, damage assessment, and structural monitoring.
 
 ### Key Features
 
