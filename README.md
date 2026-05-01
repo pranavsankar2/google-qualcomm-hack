@@ -108,3 +108,19 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 6. **View results**:
    - Live point cloud visualization
 7. **Export** results for structural reports
+
+### References
+1. MiDaS v2.1 - Depth Estimation
+
+Paper: "Towards Robust Monocular Depth Estimation: Mixing Datasets for Zero-shot Cross-dataset Transfer"
+Authors: Ranftl, R., Lasinger, K., Hafner, D., et al.
+URL: https://arxiv.org/abs/1907.01341
+Used for: Real-time monocular depth estimation from RGB images
+Model: mobile_gs_quant.tflite (MobileNet backbone variant)
+EfficientNet-Lite0 - Compression Encoder
+
+2. Paper: "EfficientNet: Rethinking Model Scaling for Convolutional Neural Networks"
+Authors: Tan, M., & Le, Q. V.
+URL: https://arxiv.org/abs/1905.11946
+Used for: Scene embedding & point cloud compression (RENO encoder)
+Variant: EfficientNet-Lite (mobile-optimized)
