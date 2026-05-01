@@ -14,14 +14,14 @@
   - Point density and scan coverage metrics
   - Surface planarity & roughness via PCA covariance
   - Structural defect detection (cracks, moisture, voids, settlement)
-- **NPU Acceleration**: Offloads TensorFlow Lite inference to Qualcomm Hexagon HTP for efficient on-device processing
+- **NPU Acceleration**: Offloads LiteRT model inference to Qualcomm Hexagon HTP for efficient on-device processing
 - **Detailed Reporting**: Generates structural quality score (0–100) with flagged defects and severity levels
 
 ### Technology Stack
 
 - **Language**: Kotlin + Jetpack Compose (UI)
 - **Cameras & Video**: CameraX
-- **ML Inference**: TensorFlow Lite with NNAPI (NPU acceleration)
+- **ML Inference**: LiteRT with NPU acceleration
 - **Models**: MiDaS v2.1 (depth), EfficientNet-Lite0 (compression)
 - **Async**: Kotlin Coroutines
 - **Min SDK**: Android 8.0 (API 26) | Target SDK: Android 15 (API 36)
@@ -58,7 +58,7 @@ cd google-qualcomm-hack
 
 ### Step 2: Models
 
-The TensorFlow Lite models are placed in the `models/` directory:
+The LiteRT models are placed in the `models/` directory:
 
 ### Step 3: Build the Application
 
@@ -73,7 +73,7 @@ The project uses managed dependencies via Gradle (see `app/build.gradle.kts`). K
 
 - Jetpack Compose (UI framework)
 - CameraX (camera access)
-- TensorFlow Lite (ML inference)
+- LiteRT (ML inference)
 - Kotlin Coroutines (async runtime)
 
 These are automatically resolved during the build.
