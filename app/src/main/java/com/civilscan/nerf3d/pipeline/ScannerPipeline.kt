@@ -4,8 +4,6 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.util.Log
 import com.civilscan.nerf3d.data.*
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import kotlin.math.*
 import kotlin.random.Random
 
@@ -40,15 +38,41 @@ class ScannerPipeline(context: Context) {
         const val ENC_W = 224; const val ENC_H = 224; const val LATENT_DIM = 1024
 
         // Depth inference throttle: run MiDaS every N frames, reuse last depth in between
-        private const val DEPTH_SKIP = 6
+        private const val DEPTH_SKIP = 3
 
         // Pinhole intrinsics for 256×256 (~65° HFOV rear camera)
         private const val FX = 190f; private const val FY = 190f
         private const val CX = 128f; private const val CY = 128f
         private const val MAX_D = 8f; private const val MIN_D = 0.3f
 
+        private const val DEPTH_MIN_VALID = 0.35f
+        private const val DEPTH_MAX_VALID = 7.75f
+        private const val DEPTH_SMOOTH_ALPHA = 0.2f
+
+        // Fixed disparity → depth mapping. Scene-independent; the constants are
+        // properties of the MiDaS model's output range, not the scene.
+        // Tuned for this specific quantized model: raw output spans ~[0, 1100].
+        //   raw ≈ 100  → 10 m (far)
+        //   raw ≈ 500  → 2 m  (mid)
+        //   raw ≈ 1100 → 0.9 m (near)
+        // Re-tune by reading the "MiDaS raw" log line.
+        private const val RAW_DISP_MIN = 100f       // smallest disparity we trust → far
+        private const val RAW_DISP_MAX = 2500f      // largest disparity we trust → near
+        private const val DEPTH_K      = 1000f      // depth = DEPTH_K / disparity
+
+        // Edge confidence: skip pixels where depth changes sharply between
+        // neighbors (relative to local depth). MiDaS hallucinates around object
+        // edges, so emitting Gaussians there produces "streamer" artifacts.
+        private const val EDGE_REL_THRESH = 0.18f
+
+        // Voxel-grid dedup on accumulation. ~5 cm voxels: industry-standard
+        // densification bound for splat-style point clouds. Caps memory growth
+        // and prevents per-frame duplicate Gaussians at the same world location.
+        private const val VOXEL_SIZE = 0.05f
+        private const val VOXEL_RANGE = 1024     // ±51.2 m at 5 cm voxels
+
         // Point cloud sampling
-        private const val STRIDE = 8               // ~1 024 pts/frame
+        private const val STRIDE = 4               // ~4 096 pts/frame
 
         // Optical flow
         private const val FEAT_STEP   = 20         // feature grid spacing
@@ -60,7 +84,14 @@ class ScannerPipeline(context: Context) {
         private const val RANSAC_N    = 25         // RANSAC iterations
         private const val INLIER_R    = 0.12f      // 12 cm inlier radius
         private const val MIN_INLIERS = 6          // min inliers to trust estimate
-        private const val MAX_DT      = 0.4f       // max translation per frame (m)
+        private const val MAX_DT      = 0.1f       // max translation per frame (m)
+
+        // Pose-drift containment. The IMU integrator + optical-flow estimator
+        // both accumulate error every frame; without these caps the splat slowly
+        // walks away from where the user pointed the camera.
+        private const val MAX_WORLD_DRIFT = 2.0f    // hard clamp on worldT magnitude (m)
+        private const val VEL_DAMP_RATE   = 3.0f    // exp(-RATE·dt) — was 0.2; ~0.23s half-life
+        private const val ACCEL_DEADZONE  = 0.5f    // ignore |accel| < this (m/s²); sensor noise floor
 
         const val SHARD_MAX_POINTS = 250_000
         const val METERS_PER_UNIT  = 1f
@@ -79,18 +110,24 @@ class ScannerPipeline(context: Context) {
     val isSimulated:  Boolean get() = models.gs == null
     val renoLoaded:   Boolean get() = models.reno != null
 
-    // ── Inference buffers ─────────────────────────────────────────────────────
-    private val depthIn  = ByteBuffer.allocateDirect(DEPTH_H * DEPTH_W * 3 * 4)
-        .apply { order(ByteOrder.nativeOrder()) }
-    private val depthOut = Array(1) { Array(DEPTH_H) { Array(DEPTH_W) { FloatArray(1) } } }
-    private val encIn    = ByteBuffer.allocateDirect(ENC_H * ENC_W * 3 * 4)
-        .apply { order(ByteOrder.nativeOrder()) }
-    private val encOut   = Array(1) { FloatArray(LATENT_DIM) }
+    // ── Inference buffers (LiteRT TensorBuffer-based) ─────────────────────────
+    // Staging FloatArrays hold pixel-prepared input; we copy into LiteRT
+    // TensorBuffers right before run(). Output is read back as a flat
+    // FloatArray and reshaped in buildDepth().
+    private val depthInArr = FloatArray(DEPTH_H * DEPTH_W * 3)
+    private val depthInBufs  by lazy { models.gs?.createInputBuffers()  ?: emptyList() }
+    private val depthOutBufs by lazy { models.gs?.createOutputBuffers() ?: emptyList() }
+    private val encInArr = FloatArray(ENC_H * ENC_W * 3)
+    private val encInBufs    by lazy { models.reno?.createInputBuffers()  ?: emptyList() }
+    private val encOutBufs   by lazy { models.reno?.createOutputBuffers() ?: emptyList() }
 
     // ── Accumulation ──────────────────────────────────────────────────────────
     private val acc = mutableListOf<GaussianPoint>()
     private var frameCount = 0
     private var lastBmp: Bitmap? = null
+
+    // Voxel occupancy set for dedup. Cleared on reset; pruned with `acc`.
+    private val occupiedVoxels = HashSet<Long>()
 
     // ── SLAM state ────────────────────────────────────────────────────────────
     // World = coordinate frame of first camera frame (Z forward, Y up, X right)
@@ -116,7 +153,7 @@ class ScannerPipeline(context: Context) {
     // ── Public API ────────────────────────────────────────────────────────────
 
     fun reset() {
-        acc.clear(); frameCount = 0; lastBmp = null
+        acc.clear(); occupiedVoxels.clear(); frameCount = 0; lastBmp = null
         initR = null
         worldTx = 0f; worldTy = 0f; worldTz = 0f
         prevGray = null; prevDepth = null; prevRrel = null
@@ -125,18 +162,35 @@ class ScannerPipeline(context: Context) {
     }
 
     fun resetAccumulationOnly() {
-        acc.clear(); frameCount = 0; lastBmp = null
-        // SLAM pose (initR, worldT, prevGray, prevDepth, prevRrel) intentionally kept
+        acc.clear(); occupiedVoxels.clear(); frameCount = 0; lastBmp = null
+        // SLAM pose and disparity calibration intentionally kept.
     }
 
     @Synchronized
     fun processFrame(bitmap: Bitmap, sensorR: FloatArray? = null, accWorld: FloatArray? = null): FrameResult {
         frameCount++; lastBmp = bitmap
         val t0 = System.currentTimeMillis()
-        val pts = if (!isSimulated) realFrame(bitmap, sensorR, accWorld) else simFrame(sensorR)
-        acc += pts
-        if (acc.size > 350_000) repeat(acc.size - 250_000) { acc.removeAt(0) }
-        return FrameResult(pts, System.currentTimeMillis() - t0, isSimulated)
+        val raw = if (!isSimulated) realFrame(bitmap, sensorR, accWorld) else simFrame(sensorR)
+        val added = ArrayList<GaussianPoint>(raw.size)
+        for (g in raw) {
+            val key = voxelKey(g.x, g.y, g.z)
+            if (occupiedVoxels.add(key)) { acc += g; added += g }
+        }
+        if (acc.size > 500_000) {
+            val drop = acc.size - 350_000
+            for (i in 0 until drop) {
+                val g = acc[i]; occupiedVoxels.remove(voxelKey(g.x, g.y, g.z))
+            }
+            repeat(drop) { acc.removeAt(0) }
+        }
+        return FrameResult(added, System.currentTimeMillis() - t0, isSimulated)
+    }
+
+    private fun voxelKey(x: Float, y: Float, z: Float): Long {
+        val vx = (floor(x / VOXEL_SIZE).toInt() + VOXEL_RANGE).toLong() and 0x7FF
+        val vy = (floor(y / VOXEL_SIZE).toInt() + VOXEL_RANGE).toLong() and 0x7FF
+        val vz = (floor(z / VOXEL_SIZE).toInt() + VOXEL_RANGE).toLong() and 0x7FF
+        return (vx shl 22) or (vy shl 11) or vz
     }
 
     fun compressAndFinalize(): CompressedScan {
@@ -177,12 +231,14 @@ class ScannerPipeline(context: Context) {
 
         // Only run MiDaS every DEPTH_SKIP frames; reuse last depth map in between
         depthFrameCounter++
-        val depth: Array<FloatArray>
+        var depth: Array<FloatArray>
         if (depthFrameCounter % DEPTH_SKIP == 0 || latestDepthArray == null) {
             prepDepthIn(scaled)
-            depthOut[0].forEach { r -> r.forEach { it.fill(0f) } }
-            models.gs!!.run(depthIn, depthOut)
-            depth = buildDepth()
+            models.gs!!.run(depthInBufs, depthOutBufs)
+            val rawOut = depthOutBufs[0].readFloat()
+            depth = buildDepth(rawOut)
+            val prev = prevDepth
+            if (prev != null) depth = smoothTemporalDepth(depth, prev)
             latestDepthArray  = depth
             cachedDepthBitmap = buildDepthBitmap(depth)
         } else {
@@ -195,12 +251,13 @@ class ScannerPipeline(context: Context) {
 
         // Translation: prefer accelerometer (metric), fall back to optical flow
         if (accWorld != null && dt > 0f) {
-            val ax = if (abs(accWorld[0]) > 0.2f) accWorld[0] else 0f
-            val ay = if (abs(accWorld[1]) > 0.2f) accWorld[1] else 0f
-            val az = if (abs(accWorld[2]) > 0.2f) accWorld[2] else 0f
+            val ax = if (abs(accWorld[0]) > ACCEL_DEADZONE) accWorld[0] else 0f
+            val ay = if (abs(accWorld[1]) > ACCEL_DEADZONE) accWorld[1] else 0f
+            val az = if (abs(accWorld[2]) > ACCEL_DEADZONE) accWorld[2] else 0f
             velX += ax * dt; velY += ay * dt; velZ += az * dt
-            // Exponential velocity decay to fight IMU bias drift (~3.5s half-life)
-            val damp = exp(-0.2f * dt)
+            // Aggressive velocity decay — IMU bias would otherwise integrate
+            // into unbounded drift even when the phone is stationary.
+            val damp = exp(-VEL_DAMP_RATE * dt)
             velX *= damp; velY *= damp; velZ *= damp
             worldTx += velX * dt; worldTy += velY * dt; worldTz += velZ * dt
         } else {
@@ -210,6 +267,12 @@ class ScannerPipeline(context: Context) {
                 worldTx += dx; worldTy += dy; worldTz += dz
             }
         }
+        // Hard clamp on accumulated world translation. Whatever the IMU /
+        // optical-flow estimator says, the splat can't walk further than
+        // MAX_WORLD_DRIFT from the origin where the first frame anchored.
+        worldTx = worldTx.coerceIn(-MAX_WORLD_DRIFT, MAX_WORLD_DRIFT)
+        worldTy = worldTy.coerceIn(-MAX_WORLD_DRIFT, MAX_WORLD_DRIFT)
+        worldTz = worldTz.coerceIn(-MAX_WORLD_DRIFT, MAX_WORLD_DRIFT)
 
         prevGray = gray; prevDepth = depth; prevRrel = Rrel
         return unproject(depth, scaled, Rrel)
@@ -241,7 +304,19 @@ class ScannerPipeline(context: Context) {
         Rrel[i]
     }
 
-    /** Unproject depth map to world-space Gaussians: P_world = Rrel * P_cam + T */
+    /**
+     * Unproject depth map to world-space Gaussians: P_world = Rrel * P_cam + T.
+     *
+     * Per-pixel filters:
+     *  • depth ∈ [DEPTH_MIN_VALID, MAX_D − 0.1)
+     *  • relative depth gradient < EDGE_REL_THRESH (skip object boundaries
+     *    where MiDaS hallucinates streamer points)
+     *
+     * Splat sizing: each Gaussian covers the world-space footprint of its
+     * source pixel block at depth d → scale = d · STRIDE / FX. This is the
+     * standard depth-map-to-3DGS initializer (used in 3DGS / Mip-Splatting
+     * preprocessing).
+     */
     private fun unproject(
         depth: Array<FloatArray>, colorBmp: Bitmap, Rrel: FloatArray
     ): List<GaussianPoint> {
@@ -249,18 +324,32 @@ class ScannerPipeline(context: Context) {
         val px = IntArray(DEPTH_W * DEPTH_H)
         colorBmp.getPixels(px, 0, DEPTH_W, 0, 0, DEPTH_W, DEPTH_H)
         val out = ArrayList<GaussianPoint>((DEPTH_W / STRIDE) * (DEPTH_H / STRIDE))
+        val pixelScale = STRIDE.toFloat() / FX     // angular size of one stride-step
+        val uMin = STRIDE; val uMax = DEPTH_W - STRIDE
+        val vMin = STRIDE; val vMax = DEPTH_H - STRIDE
         for (v in 0 until DEPTH_H step STRIDE) {
             for (u in 0 until DEPTH_W step STRIDE) {
-                val d = depth[v][u]; if (d > MAX_D - 0.1f) continue
+                val d = depth[v][u]
+                if (d > MAX_D - 0.1f || d < DEPTH_MIN_VALID) continue
+
+                // Relative depth gradient — skip depth discontinuities.
+                if (u in uMin until uMax && v in vMin until vMax) {
+                    val gx = depth[v][u + STRIDE] - depth[v][u - STRIDE]
+                    val gy = depth[v + STRIDE][u] - depth[v - STRIDE][u]
+                    val rel = (abs(gx) + abs(gy)) / d
+                    if (rel > EDGE_REL_THRESH) continue
+                }
+
                 val cx = (u - CX) * d / FX
                 val cy = (v - CY) * d / FY
+                val s  = d * pixelScale
                 val argb = px[v * DEPTH_W + u]
                 out += GaussianPoint(
                     x = R[0]*cx + R[1]*cy + R[2]*d + worldTx,
                     y = R[3]*cx + R[4]*cy + R[5]*d + worldTy,
                     z = R[6]*cx + R[7]*cy + R[8]*d + worldTz,
-                    opacity = 0.88f,
-                    scaleX = d * 0.004f, scaleY = d * 0.004f, scaleZ = d * 0.004f,
+                    opacity = 0.9f,
+                    scaleX = s, scaleY = s, scaleZ = s,
                     r = (argb shr 16 and 0xFF) / 255f,
                     g = (argb shr  8 and 0xFF) / 255f,
                     b = (argb        and 0xFF) / 255f
@@ -387,29 +476,83 @@ class ScannerPipeline(context: Context) {
 
     // ── Depth map ─────────────────────────────────────────────────────────────
 
-    private fun buildDepth(): Array<FloatArray> {
-        var lo = Float.MAX_VALUE; var hi = -Float.MAX_VALUE
-        for (v in 0 until DEPTH_H) for (u in 0 until DEPTH_W) {
-            val d = depthOut[0][v][u][0]; if (d < lo) lo = d; if (d > hi) hi = d
-        }
-        val range = (hi - lo).coerceAtLeast(1e-4f)
-        return Array(DEPTH_H) { v ->
+    private fun buildDepth(raw: FloatArray): Array<FloatArray> {
+        // Direct fixed-mapping disparity → depth. NO per-frame normalization:
+        // that's what made the cone (flat-scene noise stretched across the full
+        // depth range). Same MiDaS raw output → same metric depth, every frame.
+        var rawMin = Float.MAX_VALUE; var rawMax = -Float.MAX_VALUE
+        val depth = Array(DEPTH_H) { v ->
             FloatArray(DEPTH_W) { u ->
-                val n = (depthOut[0][v][u][0] - lo) / range
-                (1f - n) * MAX_D + MIN_D
+                val r = raw[v * DEPTH_W + u]
+                if (r < rawMin) rawMin = r
+                if (r > rawMax) rawMax = r
+                val disp = r.coerceIn(RAW_DISP_MIN, RAW_DISP_MAX)
+                (DEPTH_K / disp).coerceIn(DEPTH_MIN_VALID, DEPTH_MAX_VALID)
             }
         }
+        // Diagnostic: read this once after a scan to tune RAW_DISP_MIN/MAX/K.
+        // If raw range is tiny (e.g., [0.4, 0.6]) the model's output is in a
+        // narrow band — adjust the constants so 1/disp lands in your target
+        // depth range. If raw range is huge (e.g., [0, 200]) divide by a scale
+        // before mapping.
+        if (frameCount % 30 == 1) {
+            val dNear = DEPTH_K / rawMax
+            val dFar  = DEPTH_K / rawMin.coerceAtLeast(1e-4f)
+            Log.d(TAG, "MiDaS raw=[%.3f, %.3f] → depth=[%.2f, %.2f]m"
+                .format(rawMin, rawMax, dNear, dFar))
+        }
+        return medianFilterDepth(depth)
     }
 
-    private fun prepDepthIn(bmp: Bitmap) {
-        depthIn.rewind()
-        val px = IntArray(DEPTH_W * DEPTH_H); bmp.getPixels(px, 0, DEPTH_W, 0, 0, DEPTH_W, DEPTH_H)
-        for (p in px) {
-            depthIn.putFloat(((p shr 16 and 0xFF) / 255f - MEAN[0]) / STD[0])
-            depthIn.putFloat(((p shr  8 and 0xFF) / 255f - MEAN[1]) / STD[1])
-            depthIn.putFloat(((p        and 0xFF) / 255f - MEAN[2]) / STD[2])
+    /**
+     * Median filter: smooth depth map to reduce noise and isolated pixels.
+     * Uses 3×3 neighborhood median.
+     */
+    private fun medianFilterDepth(depth: Array<FloatArray>): Array<FloatArray> {
+        val result = Array(DEPTH_H) { FloatArray(DEPTH_W) }
+        val neighborhood = FloatArray(9)
+
+        for (v in 0 until DEPTH_H) {
+            for (u in 0 until DEPTH_W) {
+                var n = 0
+                for (dv in -1..1) {
+                    for (du in -1..1) {
+                        val nv = (v + dv).coerceIn(0, DEPTH_H - 1)
+                        val nu = (u + du).coerceIn(0, DEPTH_W - 1)
+                        neighborhood[n++] = depth[nv][nu]
+                    }
+                }
+                neighborhood.sort()
+                result[v][u] = neighborhood[4]
+            }
         }
-        depthIn.rewind()
+        return result
+    }
+
+    private fun smoothTemporalDepth(
+        current: Array<FloatArray>,
+        previous: Array<FloatArray>
+    ): Array<FloatArray> {
+        val smoothed = Array(DEPTH_H) { FloatArray(DEPTH_W) }
+        for (v in 0 until DEPTH_H) {
+            for (u in 0 until DEPTH_W) {
+                smoothed[v][u] = lerp(previous[v][u], current[v][u], DEPTH_SMOOTH_ALPHA)
+            }
+        }
+        return smoothed
+    }
+
+    private fun lerp(a: Float, b: Float, t: Float) = a + (b - a) * t
+
+    private fun prepDepthIn(bmp: Bitmap) {
+        val px = IntArray(DEPTH_W * DEPTH_H); bmp.getPixels(px, 0, DEPTH_W, 0, 0, DEPTH_W, DEPTH_H)
+        var i = 0
+        for (p in px) {
+            depthInArr[i++] = ((p shr 16 and 0xFF) / 255f - MEAN[0]) / STD[0]
+            depthInArr[i++] = ((p shr  8 and 0xFF) / 255f - MEAN[1]) / STD[1]
+            depthInArr[i++] = ((p        and 0xFF) / 255f - MEAN[2]) / STD[2]
+        }
+        depthInBufs[0].writeFloat(depthInArr)
     }
 
     private fun toGray(bmp: Bitmap): FloatArray {
@@ -434,17 +577,17 @@ class ScannerPipeline(context: Context) {
 
     private fun runEncoder(bmp: Bitmap): FloatArray {
         val scaled = Bitmap.createScaledBitmap(bmp, ENC_W, ENC_H, true)
-        encIn.rewind()
         val px = IntArray(ENC_W * ENC_H); scaled.getPixels(px, 0, ENC_W, 0, 0, ENC_W, ENC_H)
+        var i = 0
         for (p in px) {
-            encIn.putFloat((p shr 16 and 0xFF) / 255f)
-            encIn.putFloat((p shr  8 and 0xFF) / 255f)
-            encIn.putFloat((p        and 0xFF) / 255f)
+            encInArr[i++] = (p shr 16 and 0xFF) / 255f
+            encInArr[i++] = (p shr  8 and 0xFF) / 255f
+            encInArr[i++] = (p        and 0xFF) / 255f
         }
-        encIn.rewind(); encOut[0].fill(0f)
         return runCatching {
-            models.reno!!.run(encIn, encOut)
-            encOut[0].clone()
+            encInBufs[0].writeFloat(encInArr)
+            models.reno!!.run(encInBufs, encOutBufs)
+            encOutBufs[0].readFloat()
         }.getOrElse { simLatent() }
     }
 

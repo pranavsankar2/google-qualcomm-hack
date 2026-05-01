@@ -1,88 +1,66 @@
 package com.civilscan.nerf3d.pipeline
 
 import android.content.Context
+import android.os.Build
 import android.util.Log
-import org.tensorflow.lite.Interpreter
-import org.tensorflow.lite.nnapi.NnApiDelegate
+import com.google.ai.edge.litert.Accelerator
+import com.google.ai.edge.litert.CompiledModel
 import java.io.File
-import java.io.FileInputStream
-import java.nio.channels.FileChannel
 
 class ModelManager(private val context: Context) {
 
     companion object {
         private const val TAG     = "ModelManager"
-        const val MODEL_DEPTH = "mobile_gs_quant.tflite"   // MiDaS depth estimator
-        const val MODEL_RENO  = "reno_quant.tflite"         // EfficientNet encoder
+        const val MODEL_DEPTH = "mobile_gs_quant.tflite"
+        const val MODEL_RENO  = "reno_quant.tflite"
     }
 
     data class LoadedModels(
-        val gs:           Interpreter?,   // depth (MiDaS)
-        val reno:         Interpreter?,   // encoder (EfficientNet)
+        val gs:           CompiledModel?,
+        val reno:         CompiledModel?,
         val npuActive:    Boolean,
         val delegateType: String
     )
 
-    private var nnApiDelegate: NnApiDelegate? = null
-
     fun loadModels(): LoadedModels {
         val dir = File(context.getExternalFilesDir(null), "models").also { it.mkdirs() }
         Log.i(TAG, "Models dir: ${dir.absolutePath}  canRead=${dir.canRead()}")
+        Log.i(TAG, "Device: ${Build.MANUFACTURER} ${Build.MODEL}  SoC=${Build.SOC_MODEL ?: "unknown"}")
 
-        // Attempt 1: NNAPI → Qualcomm Hexagon HTP / NPU on Snapdragon
-        val nnApi = tryNnApi()
-        if (nnApi != null) {
-            val npuOpts = Interpreter.Options().apply { addDelegate(nnApi) }
-            val gsNpu   = load(File(dir, MODEL_DEPTH), npuOpts)
-            if (gsNpu != null) {
-                nnApiDelegate = nnApi
-                val renoNpu = load(File(dir, MODEL_RENO), npuOpts)
-                Log.i(TAG, "NPU active via NNAPI  MiDaS=true  RENO=${renoNpu != null}")
-                return LoadedModels(gsNpu, renoNpu, npuActive = true, delegateType = "NPU")
-            }
-            Log.w(TAG, "NNAPI available but model failed on NPU — falling back to CPU")
-            nnApi.close()
+        val depthFile = File(dir, MODEL_DEPTH)
+        val renoFile  = File(dir, MODEL_RENO)
+
+        // Try accelerators in order of preference. LiteRT 2.x bypasses NNAPI
+        // entirely — NPU here means real Hexagon HTP via Google AI Edge stack.
+        val preferences = listOf(Accelerator.NPU, Accelerator.GPU, Accelerator.CPU)
+        for (accel in preferences) {
+            val gs = loadOn(depthFile, accel) ?: continue
+            val reno = loadOn(renoFile, accel)
+            val npuActive = (accel == Accelerator.NPU)
+            Log.i(TAG, "✓ Models loaded with accelerator=$accel  RENO=${reno != null}")
+            return LoadedModels(gs, reno, npuActive, accel.toString())
         }
 
-        // Fallback: CPU with 4 threads
-        val cpuOpts = Interpreter.Options().apply { numThreads = 4 }
-        val gs   = load(File(dir, MODEL_DEPTH), cpuOpts)
-        val reno = load(File(dir, MODEL_RENO),  cpuOpts)
-        Log.i(TAG, "CPU mode  MiDaS=${gs != null}  RENO=${reno != null}")
-        return LoadedModels(gs, reno, npuActive = false, delegateType = "CPU")
+        Log.e(TAG, "All accelerators failed — model files present? depth=${depthFile.exists()} reno=${renoFile.exists()}")
+        return LoadedModels(null, null, npuActive = false, delegateType = "FAILED")
     }
 
-    private fun tryNnApi(): NnApiDelegate? = runCatching {
-        NnApiDelegate(
-            NnApiDelegate.Options()
-                .setExecutionPreference(NnApiDelegate.Options.EXECUTION_PREFERENCE_SUSTAINED_SPEED)
-        ).also { Log.i(TAG, "NnApiDelegate created") }
-    }.getOrElse { e ->
-        Log.w(TAG, "NNAPI unavailable: ${e.message}")
-        null
-    }
-
-    private fun load(file: File, opts: Interpreter.Options): Interpreter? {
+    private fun loadOn(file: File, accel: Accelerator): CompiledModel? {
         if (!file.exists()) {
             Log.w(TAG, "Missing: ${file.name}  path=${file.absolutePath}")
             return null
         }
         return runCatching {
-            val buf = FileInputStream(file).channel
-                .map(FileChannel.MapMode.READ_ONLY, 0, file.length())
-            Interpreter(buf, opts).also { interp ->
-                val inp = interp.getInputTensor(0).shape().toList()
-                val out = interp.getOutputTensor(0).shape().toList()
-                Log.i(TAG, "✓ ${file.name}  (${file.length() / 1024} KB)  in=$inp  out=$out")
+            CompiledModel.create(file.absolutePath, CompiledModel.Options(accel)).also {
+                Log.i(TAG, "✓ ${file.name}  on=$accel  (${file.length() / 1024} KB)")
             }
         }.getOrElse { e ->
-            Log.e(TAG, "✗ ${file.name}: ${e.message}")
+            Log.w(TAG, "✗ ${file.name} on $accel: ${e.message}")
             null
         }
     }
 
     fun close() {
-        nnApiDelegate?.close()
-        nnApiDelegate = null
+        // CompiledModel resources are released by the runtime when no longer referenced.
     }
 }

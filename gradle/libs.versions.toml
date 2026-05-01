@@ -9,7 +9,7 @@ material = "1.12.0"
 activity = "1.9.3"
 lifecycle = "2.8.7"
 navigation = "2.8.5"
-tensorflowLite = "2.16.1"
+litert = "2.1.0"
 coroutines = "1.9.0"
 junit = "4.13.2"
 junitExt = "1.2.1"
@@ -39,7 +39,7 @@ camerax-camera2            = { group = "androidx.camera",         name = "camera
 camerax-lifecycle          = { group = "androidx.camera",         name = "camera-lifecycle",        version.ref = "cameraX"   }
 camerax-view               = { group = "androidx.camera",         name = "camera-view",             version.ref = "cameraX"   }
 
-litert-core                = { group = "org.tensorflow",           name = "tensorflow-lite",      version.ref = "tensorflowLite" }
+litert-core                = { group = "com.google.ai.edge.litert", name = "litert",               version.ref = "litert" }
 
 kotlinx-coroutines-android = { group = "org.jetbrains.kotlinx",  name = "kotlinx-coroutines-android", version.ref = "coroutines" }
 
