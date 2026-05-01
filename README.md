@@ -124,3 +124,8 @@ Authors: Tan, M., & Le, Q. V.
 URL: https://arxiv.org/abs/1905.11946
 Used for: Scene embedding & point cloud compression (RENO encoder)
 Variant: EfficientNet-Lite (mobile-optimized)
+
+
+### Release Information
+Please see release at this link:
+https://github.com/pranavsankar2/google-qualcomm-hack/releases/tag/1.0
