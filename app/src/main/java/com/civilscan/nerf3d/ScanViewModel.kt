@@ -1,15 +1,19 @@
 package com.civilscan.nerf3d
 
 import android.app.Application
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.ImageFormat
 import android.graphics.Rect
 import android.graphics.YuvImage
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import androidx.camera.core.ImageProxy
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.civilscan.nerf3d.analysis.CivilAnalysisEngine
 import com.civilscan.nerf3d.data.*
 import com.civilscan.nerf3d.export.ExportManager
 import com.civilscan.nerf3d.pipeline.ScannerPipeline
@@ -23,119 +27,172 @@ import java.io.ByteArrayOutputStream
 class ScanViewModel(app: Application) : AndroidViewModel(app) {
 
     private val pipeline = ScannerPipeline(app)
-    private val analysis = CivilAnalysisEngine()
     val export           = ExportManager(app)
 
-    // ── State flows ───────────────────────────────────────────────────────────
+    // ── State ─────────────────────────────────────────────────────────────────
 
-    private val _scanState      = MutableStateFlow<ScanState>(ScanState.Idle)
-    val scanState: StateFlow<ScanState> = _scanState.asStateFlow()
+    private val _state    = MutableStateFlow<ScanState>(ScanState.Idle)
+    val scanState: StateFlow<ScanState> = _state.asStateFlow()
 
-    private val _analysisResult = MutableStateFlow<AnalysisResult?>(null)
-    val analysisResult: StateFlow<AnalysisResult?> = _analysisResult.asStateFlow()
-
-    private val _gaussians      = MutableStateFlow<List<GaussianPoint>>(emptyList())
+    private val _gaussians = MutableStateFlow<List<GaussianPoint>>(emptyList())
     val gaussians: StateFlow<List<GaussianPoint>> = _gaussians.asStateFlow()
 
-    private val _exportedFile   = MutableStateFlow<ExportedFile?>(null)
-    val exportedFile: StateFlow<ExportedFile?> = _exportedFile.asStateFlow()
+    private val _shards = MutableStateFlow<List<ExportedFile>>(emptyList())
+    val shards: StateFlow<List<ExportedFile>> = _shards.asStateFlow()
 
-    val delegateType: String  get() = pipeline.delegateType
-    val npuActive: Boolean    get() = pipeline.npuActive
-    val isSimulated: Boolean  get() = pipeline.isSimulated
+    val isSimulated:  Boolean get() = pipeline.isSimulated
+    val midasLoaded:  Boolean = !pipeline.isSimulated   // fixed at init time, no StateFlow needed
+    val renoLoaded:   Boolean = pipeline.renoLoaded
 
-    // ── Scan lifecycle ────────────────────────────────────────────────────────
+    private val _depthBitmap = MutableStateFlow<Bitmap?>(null)
+    val depthBitmap: StateFlow<Bitmap?> = _depthBitmap.asStateFlow()
 
-    fun startScan() {
-        pipeline.reset()
-        _analysisResult.value = null
-        _exportedFile.value   = null
-        _scanState.value = ScanState.Scanning(delegateType = pipeline.delegateType)
+    // ── Sensors ───────────────────────────────────────────────────────────────
+
+    private val sensorManager = app.getSystemService(Context.SENSOR_SERVICE) as SensorManager
+    private val rotSensor  = sensorManager.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR)
+    private val accSensor  = sensorManager.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION)
+    @Volatile private var latestR:   FloatArray? = null
+    @Volatile private var latestAcc: FloatArray? = null
+
+    private val sensorListener = object : SensorEventListener {
+        private val mat = FloatArray(9)
+        override fun onSensorChanged(e: SensorEvent) {
+            when (e.sensor.type) {
+                Sensor.TYPE_GAME_ROTATION_VECTOR -> {
+                    SensorManager.getRotationMatrixFromVector(mat, e.values)
+                    latestR = mat.copyOf()
+                }
+                Sensor.TYPE_LINEAR_ACCELERATION -> latestAcc = e.values.copyOf()
+            }
+        }
+        override fun onAccuracyChanged(s: Sensor?, a: Int) {}
     }
 
-    /** Called from CameraX ImageAnalysis on each frame. */
-    fun onFrame(image: ImageProxy) {
-        val bitmap = image.toBitmap()
-        image.close()
-        if (bitmap == null || _scanState.value !is ScanState.Scanning) return
+    init {
+        sensorManager.registerListener(sensorListener, rotSensor, SensorManager.SENSOR_DELAY_GAME)
+        accSensor?.let { sensorManager.registerListener(sensorListener, it, SensorManager.SENSOR_DELAY_GAME) }
+    }
 
-        viewModelScope.launch(Dispatchers.Default) {
-            val result = pipeline.processFrame(bitmap)
-            val current = _scanState.value
-            if (current is ScanState.Scanning) {
-                _scanState.value = current.copy(
-                    gaussianCount = pipeline.getGaussians().size,
-                    frameCount    = current.frameCount + 1,
-                    inferenceMs   = result.inferenceMs,
-                    isSimulated   = result.isSimulated
+    // ── Controls ──────────────────────────────────────────────────────────────
+
+    /** Start scanning from idle, or resume from paused. */
+    fun start() {
+        when (val s = _state.value) {
+            is ScanState.Idle -> {
+                pipeline.reset()
+                _gaussians.value = emptyList()
+                _shards.value    = emptyList()
+                framesSinceGlUpdate = 0
+                _state.value = ScanState.Running()
+            }
+            is ScanState.Paused -> {
+                _state.value = ScanState.Running(
+                    pointCount  = s.pointCount,
+                    shardCount  = s.shardCount
                 )
             }
-            // Throttle GL updates: every 8 frames
-            val fc = (_scanState.value as? ScanState.Scanning)?.frameCount ?: 0
-            if (fc % 8 == 0) _gaussians.value = pipeline.getGaussians().takeLast(50_000)
+            else -> {}
         }
     }
 
-    fun stopAndAnalyze() {
-        if (_scanState.value !is ScanState.Scanning) return
-        _scanState.value = ScanState.Compressing(0f)
+    /** Pause mid-scan. If a shard is in progress let it finish first. */
+    fun pause() {
+        val s = _state.value
+        if (s is ScanState.Running) {
+            _state.value = ScanState.Paused(s.pointCount, s.shardCount)
+        } else if (s is ScanState.Sharding) {
+            pauseAfterShard = true
+        }
+    }
+
+    /** Clear everything and start a brand-new recording from zero. */
+    fun newRecording() {
+        pauseAfterShard = false
+        pipeline.reset()
+        _gaussians.value = emptyList()
+        _shards.value    = emptyList()
+        framesSinceGlUpdate = 0
+        _state.value = ScanState.Running()
+    }
+
+    // ── Frame processing ──────────────────────────────────────────────────────
+
+    private var framesSinceGlUpdate = 0
+    @Volatile private var pauseAfterShard = false
+
+    fun onFrame(image: ImageProxy) {
+        val bmp = image.toBitmap(); image.close()
+        if (bmp == null || _state.value !is ScanState.Running) return
+        val R   = latestR
+        val acc = latestAcc
+        // Rotate linear acceleration from device frame to world frame: a_world = R * a_device
+        val accWorld = if (R != null && acc != null) floatArrayOf(
+            R[0]*acc[0] + R[1]*acc[1] + R[2]*acc[2],
+            R[3]*acc[0] + R[4]*acc[1] + R[5]*acc[2],
+            R[6]*acc[0] + R[7]*acc[1] + R[8]*acc[2]
+        ) else null
 
         viewModelScope.launch(Dispatchers.Default) {
-            _scanState.value = ScanState.Compressing(0.3f)
-            val scan = pipeline.compressAndFinalize()
-            _scanState.value = ScanState.Compressing(0.7f)
-            val gaussians = pipeline.getGaussians()
-            _gaussians.value = gaussians
-            val result = analysis.analyze(scan, gaussians)
-            _analysisResult.value  = result
-            _scanState.value = ScanState.Done(scan)
+            val result  = pipeline.processFrame(bmp, R, accWorld)
+            val current = _state.value as? ScanState.Running ?: return@launch
+            val pts     = pipeline.getGaussians().size
+            framesSinceGlUpdate++
+            _depthBitmap.value = pipeline.getDepthBitmap()
+
+            if (pts >= ScannerPipeline.SHARD_MAX_POINTS) {
+                // ── Auto-shard ────────────────────────────────────────────────
+                val idx   = current.shardCount + 1
+                _state.value = ScanState.Sharding(idx, resumeAfter = !pauseAfterShard)
+
+                val scan     = pipeline.compressAndFinalize()
+                val exported = export.exportReno(scan, "shard_$idx")
+                _shards.value = _shards.value + exported
+
+                pipeline.resetAccumulationOnly()
+                framesSinceGlUpdate = 0
+                _gaussians.value = emptyList()
+
+                if (pauseAfterShard) {
+                    pauseAfterShard = false
+                    _state.value = ScanState.Paused(0, idx)
+                } else {
+                    _state.value = ScanState.Running(
+                        pointCount  = 0,
+                        shardCount  = idx,
+                        inferenceMs = result.inferenceMs,
+                        isSimulated = result.isSimulated
+                    )
+                }
+            } else {
+                _state.value = current.copy(
+                    pointCount  = pts,
+                    inferenceMs = result.inferenceMs,
+                    isSimulated = result.isSimulated
+                )
+                if (framesSinceGlUpdate % 6 == 0) {
+                    _gaussians.value = pipeline.getGaussians()
+                }
+            }
         }
     }
 
-    // ── Export ────────────────────────────────────────────────────────────────
-
-    fun exportReno() {
-        val scan = (scanState.value as? ScanState.Done)?.scan ?: return
-        viewModelScope.launch(Dispatchers.IO) {
-            _exportedFile.value = export.exportReno(scan)
-        }
+    override fun onCleared() {
+        super.onCleared()
+        sensorManager.unregisterListener(sensorListener)
+        pipeline.close()
     }
-
-    fun exportReport() {
-        val scan   = (scanState.value as? ScanState.Done)?.scan    ?: return
-        val result = _analysisResult.value                          ?: return
-        viewModelScope.launch(Dispatchers.IO) {
-            _exportedFile.value = export.exportReport(scan, result)
-        }
-    }
-
-    fun resetScan() {
-        pipeline.reset()
-        _scanState.value      = ScanState.Idle
-        _analysisResult.value = null
-        _gaussians.value      = emptyList()
-        _exportedFile.value   = null
-    }
-
-    override fun onCleared() { super.onCleared(); pipeline.close() }
 
     // ── ImageProxy → Bitmap ───────────────────────────────────────────────────
 
     private fun ImageProxy.toBitmap(): Bitmap? = runCatching {
-        val yBuffer = planes[0].buffer
-        val uBuffer = planes[1].buffer
-        val vBuffer = planes[2].buffer
-        val yLen    = yBuffer.remaining()
-        val uLen    = uBuffer.remaining()
-        val vLen    = vBuffer.remaining()
-        val nv21    = ByteArray(yLen + uLen + vLen)
-        yBuffer.get(nv21, 0, yLen)
-        vBuffer.get(nv21, yLen, vLen)
-        uBuffer.get(nv21, yLen + vLen, uLen)
-        val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
-        val out      = ByteArrayOutputStream()
-        yuvImage.compressToJpeg(Rect(0, 0, width, height), 80, out)
-        val bytes = out.toByteArray()
-        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        val yB = planes[0].buffer; val uB = planes[1].buffer; val vB = planes[2].buffer
+        val yL = yB.remaining(); val uL = uB.remaining(); val vL = vB.remaining()
+        val nv21 = ByteArray(yL + uL + vL)
+        yB.get(nv21, 0, yL); vB.get(nv21, yL, vL); uB.get(nv21, yL + vL, uL)
+        val yuv = YuvImage(nv21, ImageFormat.NV21, width, height, null)
+        val out = ByteArrayOutputStream()
+        yuv.compressToJpeg(Rect(0, 0, width, height), 80, out)
+        BitmapFactory.decodeByteArray(out.toByteArray(), 0, out.size())
     }.getOrNull()
 }

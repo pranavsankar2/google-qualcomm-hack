@@ -95,6 +95,24 @@ class ExportManager(private val context: Context) {
         }
     }
 
+    /** Share multiple saved shard files at once via ACTION_SEND_MULTIPLE. */
+    fun shareAllIntent(paths: List<String>): Intent? {
+        val valid = paths.filter { it.isNotEmpty() }
+        if (valid.isEmpty()) return null
+        if (valid.size == 1) return shareIntent(valid[0], "application/octet-stream")
+        val uris = valid.mapNotNull { path ->
+            runCatching {
+                FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", File(path))
+            }.getOrNull()
+        }
+        if (uris.isEmpty()) return null
+        return Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+            type = "application/octet-stream"
+            putParcelableArrayListExtra(Intent.EXTRA_STREAM, ArrayList(uris))
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+    }
+
     fun listExports(): List<File> =
         exportsDir().listFiles()
             ?.filter { it.extension in listOf("reno", "png") }

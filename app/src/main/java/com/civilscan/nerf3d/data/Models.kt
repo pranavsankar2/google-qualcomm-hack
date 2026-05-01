@@ -46,17 +46,17 @@ data class CompressedScan(
 
 sealed class ScanState {
     object Idle : ScanState()
-    object PermissionRequired : ScanState()
-    data class Scanning(
-        val gaussianCount: Int  = 0,
-        val frameCount: Int     = 0,
-        val inferenceMs: Long   = 0L,
-        val delegateType: String = "NPU",
+    data class Running(
+        val pointCount:  Int     = 0,
+        val shardCount:  Int     = 0,
+        val inferenceMs: Long    = 0L,
         val isSimulated: Boolean = false
     ) : ScanState()
-    data class Compressing(val progress: Float = 0f) : ScanState()
-    data class Done(val scan: CompressedScan) : ScanState()
-    data class Error(val message: String) : ScanState()
+    data class Paused(
+        val pointCount: Int,
+        val shardCount: Int
+    ) : ScanState()
+    data class Sharding(val shardIndex: Int, val resumeAfter: Boolean = true) : ScanState()
 }
 
 // ── Civil engineering analysis output ─────────────────────────────────────────

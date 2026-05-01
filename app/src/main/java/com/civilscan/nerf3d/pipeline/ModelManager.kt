@@ -1,67 +1,60 @@
 package com.civilscan.nerf3d.pipeline
 
 import android.content.Context
-import android.os.Build
 import android.util.Log
 import org.tensorflow.lite.Interpreter
 import java.io.File
 import java.io.FileInputStream
 import java.nio.channels.FileChannel
 
-/**
- * Loads LiteRT (TFLite) models and enables the best available NPU path:
- *
- *   API 27+  →  setUseNNAPI(true)  →  Android NNAPI  →  Qualcomm Hexagon HTP
- *   Fallback →  4-thread CPU
- *
- * Models live in <externalFilesDir>/models/.
- * Push with:  bash scripts/download_models.sh
- */
 class ModelManager(private val context: Context) {
 
     companion object {
-        private const val TAG        = "ModelManager"
-        const val MODEL_GS           = "mobile_gs_quant.tflite"
-        const val MODEL_RENO         = "reno_quant.tflite"
-        const val MODEL_ANALYSIS     = "civil_analysis_quant.tflite"
+        private const val TAG     = "ModelManager"
+        // MiDaS v2.1 Small — monocular depth estimator
+        //   in : [1, 256, 256, 3] float32 ImageNet-normalised
+        //   out: [1, 256, 256, 1] float32 inverse relative depth
+        const val MODEL_DEPTH = "mobile_gs_quant.tflite"   // MiDaS depth estimator
+        const val MODEL_RENO  = "reno_quant.tflite"         // EfficientNet encoder
     }
 
     data class LoadedModels(
-        val gs:           Interpreter?,
-        val reno:         Interpreter?,
-        val analysis:     Interpreter?,
+        val gs:           Interpreter?,   // depth (MiDaS)
+        val reno:         Interpreter?,   // encoder (EfficientNet)
         val npuActive:    Boolean,
         val delegateType: String
     )
 
     fun loadModels(): LoadedModels {
         val dir = File(context.getExternalFilesDir(null), "models").also { it.mkdirs() }
+        Log.i(TAG, "Models dir: ${dir.absolutePath}  canRead=${dir.canRead()}")
 
-        // NNAPI is available from API 27 — routes to Hexagon HTP on Snapdragon 8 Elite
-        val nnApiAvailable = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
+        val opts = Interpreter.Options().apply { numThreads = 4 }
+        val gs   = load(File(dir, MODEL_DEPTH), opts)
+        val reno = load(File(dir, MODEL_RENO),  opts)
 
-        val opts = Interpreter.Options().apply {
-            numThreads = 4
-            if (nnApiAvailable) setUseNNAPI(true)
-        }
-
-        val gs       = load(File(dir, MODEL_GS),       opts)
-        val reno     = load(File(dir, MODEL_RENO),     opts)
-        val analysis = load(File(dir, MODEL_ANALYSIS), opts)
-
-        val delegate = if (nnApiAvailable) "NNAPI/HTP" else "CPU"
-        Log.i(TAG, "$delegate  GS=${gs != null}  RENO=${reno != null}  Analysis=${analysis != null}")
-        return LoadedModels(gs, reno, analysis, nnApiAvailable, delegate)
+        Log.i(TAG, "MiDaS=${gs != null}  RENO=${reno != null}")
+        return LoadedModels(gs, reno, false, "CPU")
     }
 
     private fun load(file: File, opts: Interpreter.Options): Interpreter? {
-        if (!file.exists()) { Log.w(TAG, "Missing: ${file.name}"); return null }
+        if (!file.exists()) {
+            Log.w(TAG, "Missing: ${file.name}  path=${file.absolutePath}")
+            return null
+        }
         return runCatching {
             val buf = FileInputStream(file).channel
                 .map(FileChannel.MapMode.READ_ONLY, 0, file.length())
-            Interpreter(buf, opts).also { Log.i(TAG, "Loaded ${file.name}") }
-        }.getOrElse { e -> Log.e(TAG, "Failed ${file.name}: ${e.message}"); null }
+            Interpreter(buf, opts).also { interp ->
+                val inp = interp.getInputTensor(0).shape().toList()
+                val out = interp.getOutputTensor(0).shape().toList()
+                Log.i(TAG, "✓ ${file.name}  (${file.length() / 1024} KB)  in=$inp  out=$out")
+            }
+        }.getOrElse { e ->
+            Log.e(TAG, "✗ ${file.name}: ${e.message}")
+            null
+        }
     }
 
-    fun close() { /* delegates managed internally by Interpreter */ }
+    fun close() {}
 }
