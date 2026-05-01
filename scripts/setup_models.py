@@ -28,9 +28,9 @@ MIDAS_URLS = [
     "https://tfhub.dev/intel/lite-model/midas/v2_1_small/1/lite/2?lite-format=tflite",
 ]
 
-EFFICIENTNET_URLS = [
-    "https://storage.googleapis.com/tfhub-lite-models/tensorflow/lite-model/efficientnet/lite0/feature_vectors/2/default/1.tflite",
-    "https://tfhub.dev/tensorflow/lite-model/efficientnet/lite0/feature_vectors/2/default/1?lite-format=tflite",
+ENCODER_URLS = [
+    # MobileNetV3 Small image embedder from MediaPipe (4 MB, [1,224,224,3]→[1,1024])
+    "https://storage.googleapis.com/mediapipe-models/image_embedder/mobilenet_v3_small/float32/1/mobilenet_v3_small.tflite",
 ]
 
 os.makedirs(MODELS_DIR, exist_ok=True)
@@ -137,7 +137,7 @@ def verify_local():
     print("\n── Local models ──────────────────────────────────────────────────")
     files = {
         "depth_model.tflite": (1_000, 15_000),   # 1–15 MB for MiDaS small
-        "reno_quant.tflite":  (5_000, 25_000),   # 5–25 MB for EfficientNet
+        "reno_quant.tflite":  (3_000, 8_000),    # 3–8 MB for MobileNetV3 Small
     }
     for fname, (lo, hi) in files.items():
         path = os.path.join(MODELS_DIR, fname)
@@ -172,8 +172,8 @@ if __name__ == "__main__":
         else:
             print("\n   Download failed. Try: python3 scripts/setup_models.py --stub")
 
-    reno_ok = download(EFFICIENTNET_URLS, os.path.join(MODELS_DIR, "reno_quant.tflite"),
-                       "EfficientNet-Lite0 feature vectors (scene encoder)")
+    reno_ok = download(ENCODER_URLS, os.path.join(MODELS_DIR, "reno_quant.tflite"),
+                       "MobileNetV3 Small image embedder (scene encoder)")
 
     verify_local()
     fix_device_permissions()

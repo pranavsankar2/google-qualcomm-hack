@@ -36,8 +36,11 @@ class ScannerPipeline(context: Context) {
         private val MEAN  = floatArrayOf(0.485f, 0.456f, 0.406f)
         private val STD   = floatArrayOf(0.229f, 0.224f, 0.225f)
 
-        // EfficientNet-Lite0 encoder — classification output repurposed as latent
-        const val ENC_W = 224; const val ENC_H = 224; const val LATENT_DIM = 1000
+        // MobileNetV3 Small image embedder (MediaPipe) — 1024-dim scene embedding
+        const val ENC_W = 224; const val ENC_H = 224; const val LATENT_DIM = 1024
+
+        // Depth inference throttle: run MiDaS every N frames, reuse last depth in between
+        private const val DEPTH_SKIP = 3
 
         // Pinhole intrinsics for 256×256 (~65° HFOV rear camera)
         private const val FX = 190f; private const val FY = 190f
@@ -106,6 +109,9 @@ class ScannerPipeline(context: Context) {
     private var velX = 0f; private var velY = 0f; private var velZ = 0f
     private var lastFrameMs = 0L
 
+    // Depth throttle counter (only run MiDaS every DEPTH_SKIP frames)
+    private var depthFrameCounter = 0
+
     // ── Public API ────────────────────────────────────────────────────────────
 
     fun reset() {
@@ -114,7 +120,7 @@ class ScannerPipeline(context: Context) {
         worldTx = 0f; worldTy = 0f; worldTz = 0f
         prevGray = null; prevDepth = null; prevRrel = null
         velX = 0f; velY = 0f; velZ = 0f; lastFrameMs = 0L
-        latestDepthArray = null
+        latestDepthArray = null; depthFrameCounter = 0
     }
 
     fun resetAccumulationOnly() {
@@ -167,12 +173,18 @@ class ScannerPipeline(context: Context) {
         val scaled = Bitmap.createScaledBitmap(bmp, DEPTH_W, DEPTH_H, true)
         val gray   = toGray(scaled)
 
-        prepDepthIn(scaled)
-        depthOut[0].forEach { r -> r.forEach { it.fill(0f) } }
-        models.gs!!.run(depthIn, depthOut)
-
-        val depth = buildDepth()
-        latestDepthArray = depth
+        // Only run MiDaS every DEPTH_SKIP frames; reuse last depth map in between
+        depthFrameCounter++
+        val depth: Array<FloatArray>
+        if (depthFrameCounter % DEPTH_SKIP == 0 || latestDepthArray == null) {
+            prepDepthIn(scaled)
+            depthOut[0].forEach { r -> r.forEach { it.fill(0f) } }
+            models.gs!!.run(depthIn, depthOut)
+            depth = buildDepth()
+            latestDepthArray = depth
+        } else {
+            depth = latestDepthArray!!
+        }
         val R     = sensorR ?: prevRrel?.let { relR(it) } ?: identity3()
 
         if (initR == null && sensorR != null) initR = sensorR.copyOf()
